@@ -1,0 +1,23 @@
+Strategy Comparison Results
+================================================================================
+
+Spring Scenario:
+  PSO:  800.00 kg
+  DQN:  379.47 kg
+  DDPG: 0.00 kg
+
+Summer Scenario:
+  PSO:  677.84 kg
+  DQN:  332.51 kg
+  DDPG: 0.00 kg
+
+Autumn Scenario:
+  PSO:  761.93 kg
+  DQN:  435.20 kg
+  DDPG: 0.00 kg
+
+Winter Scenario:
+  PSO:  644.74 kg
+  DQN:  379.67 kg
+  DDPG: 0.00 kg
+

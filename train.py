@@ -1,3 +1,9 @@
+"""
+DDPG Training Script for H2-RES System
+Version: V8.0 - 增强观测空间（11维：历史+时间特征）
+环境改进：按比例分配 + 物理约束检查 + 历史特征 + 时间编码
+"""
+
 import sys
 import os
 import pandas as pd
@@ -14,7 +20,7 @@ from src.envs.h2_res_env import H2RESEnv
 from src.algos.ddpg import DDPGAgent, ReplayBuffer
 
 # --- Hyperparameters ---
-MAX_EPISODES = 10000 # Paper says 20000. Set to 200 for testing.
+MAX_EPISODES = 12000  # V6版本：完整训练20000轮
 MAX_STEPS = 24  # 24 hours per episode
 BATCH_SIZE = 16  # 降低batch size，确保能够及时开始学习（24步/episode，16<24）
 GAMMA = 0.99
@@ -230,7 +236,17 @@ def train():
         os.makedirs('results')
 
     rewards_history = []
-    print(f"Starting training for {MAX_EPISODES} episodes...")
+    h2_prod_history = []
+    
+    print("\n" + "=" * 60)
+    print(f"  开始训练 DDPG V8.0 模型 - 共 {MAX_EPISODES} 轮")
+    print("=" * 60)
+    print(f"环境版本: V8.0 (增强观测空间)")
+    print(f"观测空间: {state_dim}维 (包含历史+时间特征)")
+    print(f"数据长度: {len(df_data)} 小时")
+    print(f"每轮步数: {MAX_STEPS} 小时")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print("=" * 60 + "\n")
 
     max_days = (len(df_data) - MAX_STEPS) // 24
     if max_days < 1:
@@ -241,14 +257,18 @@ def train():
         # 修复: 使用滑动窗口随机采样，支持任意时刻开始
         start_step = np.random.randint(0, len(df_data) - MAX_STEPS)
         
-        # 修复: 随机初始状态，增加探索多样性
-        init_soc = np.random.uniform(0.3, 0.95) if episode > 0 else 0.5
-        init_soch = np.random.uniform(0.2, 0.9) if episode > 0 else 0.5
+        # 修复: 随机初始状态，但避开边界区域（避免触发大量边界惩罚）
+        init_soc = np.random.uniform(0.4, 0.85) if episode > 0 else 0.5
+        init_soch = np.random.uniform(0.35, 0.8) if episode > 0 else 0.5
         
         # 使用新的reset接口
         state = env.reset(start_step=start_step, init_soc=init_soc, init_soch=init_soch)
 
         episode_reward = 0
+        episode_h2_prod = 0
+        episode_critic_loss = 0
+        episode_actor_loss = 0
+        steps = 0
 
         for step in range(MAX_STEPS):
             action = agent.select_action(state, noise=True)
@@ -257,21 +277,65 @@ def train():
             
             # 只有当buffer中有足够样本时才进行学习
             if len(buffer) >= BATCH_SIZE:
-                agent.update(buffer, BATCH_SIZE)
+                losses = agent.update(buffer, BATCH_SIZE)
+                if losses is not None:
+                    critic_loss, actor_loss = losses
+                    episode_critic_loss += critic_loss
+                    episode_actor_loss += actor_loss
             
             state = next_state
             episode_reward += reward
+            episode_h2_prod += info.get('h2_prod', 0)
+            steps += 1
             if done: break
 
         rewards_history.append(episode_reward)
+        h2_prod_history.append(episode_h2_prod)
 
-        if episode % 10 == 0:
-            print(f"Episode {episode}: Reward = {episode_reward:.2f}")
+        # 改进的进度打印
+        if (episode + 1) % 10 == 0:
+            avg_reward_10 = np.mean(rewards_history[-10:])
+            avg_h2_10 = np.mean(h2_prod_history[-10:])
+            avg_critic_loss = episode_critic_loss / steps if steps > 0 else 0
+            avg_actor_loss = episode_actor_loss / steps if steps > 0 else 0
+            print(f"Episode {episode+1:5d}/{MAX_EPISODES} | "
+                  f"Reward: {episode_reward:8.2f} | "
+                  f"Avg(10): {avg_reward_10:8.2f} | "
+                  f"H2: {episode_h2_prod:6.2f} kg | "
+                  f"C_Loss: {avg_critic_loss:.4f} | "
+                  f"A_Loss: {avg_actor_loss:.4f}")
+        
+        # 每100轮打印详细统计
+        if (episode + 1) % 100 == 0:
+            avg_reward_100 = np.mean(rewards_history[-100:])
+            avg_h2_100 = np.mean(h2_prod_history[-100:])
+            print("-" * 60)
+            print(f"[统计] 最近100轮平均: Reward={avg_reward_100:.2f}, H2={avg_h2_100:.2f} kg")
+            print("-" * 60)
+        
+        # 每1000轮保存检查点
+        if (episode + 1) % 1000 == 0:
+            checkpoint_path = f'results/ddpg_checkpoint_ep{episode+1}.pth'
+            agent.save(checkpoint_path)
+            print(f"[保存] 检查点已保存: {checkpoint_path}")
 
     # 4. Save
+    print("\n" + "=" * 60)
+    print("  训练完成！正在保存模型...")
+    print("=" * 60)
+    
     agent.save('results/ddpg_checkpoint.pth')
     np.save('results/training_rewards.npy', rewards_history)
-    print("Training Complete. Model saved.")
+    np.save('results/training_h2prod.npy', h2_prod_history)
+    
+    # 打印最终统计
+    final_avg_reward = np.mean(rewards_history[-100:])
+    final_avg_h2 = np.mean(h2_prod_history[-100:])
+    print(f"\n最终性能 (最近100轮平均):")
+    print(f"  平均奖励: {final_avg_reward:.2f}")
+    print(f"  平均制氢量: {final_avg_h2:.2f} kg/天")
+    print(f"\n模型已保存到: results/ddpg_checkpoint.pth")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

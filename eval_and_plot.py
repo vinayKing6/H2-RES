@@ -24,7 +24,7 @@ REAL_DATA_PATHS = {
     'wind': os.path.join(DATA_DIR, 'Wind farm site 1 (Nominal capacity-99MW).xlsx'),
     'solar': os.path.join(DATA_DIR, 'Solar station site 1 (Nominal capacity-50MW).xlsx')
 }
-N_CLUSTERS = 4  # 聚类出典型的 4 种天气
+N_CLUSTERS = 5  # 聚类出典型的 5 种天气（包括夜间大风场景）
 
 
 # --- 辅助函数 ---
@@ -110,8 +110,8 @@ def load_real_data_for_eval():
     return df_hourly
 
 
-def find_representative_days(df, n_clusters=4):
-    """基于风光出力特征聚类，寻找典型日"""
+def find_representative_days(df, n_clusters=5):
+    """基于风光出力特征聚类，寻找典型日（增强版：识别夜间大风）"""
     print(f"正在进行 K-Means 聚类 (k={n_clusters})...")
     n_days = len(df) // 24
     df_cut = df.iloc[:n_days * 24]
@@ -125,8 +125,23 @@ def find_representative_days(df, n_clusters=4):
     solar_norm_val = raw_irradiance / (raw_irradiance.max() + 1e-5)
     solar_features = solar_norm_val.reshape(n_days, 24)
 
+    # 增强特征：添加昼夜风电差异
+    night_mask = np.zeros(24, dtype=bool)
+    night_mask[0:6] = True
+    night_mask[18:24] = True
+    day_mask = ~night_mask
+    
+    wind_night_avg = wind_features[:, night_mask].mean(axis=1)
+    wind_day_avg = wind_features[:, day_mask].mean(axis=1)
+    wind_night_day_ratio = wind_night_avg / (wind_day_avg + 1e-5)
+
     # 组合特征
-    features = np.hstack([wind_features, solar_features])
+    features = np.hstack([
+        wind_features,
+        solar_features,
+        wind_night_day_ratio.reshape(-1, 1),
+        wind_night_avg.reshape(-1, 1)
+    ])
 
     # 聚类
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -145,26 +160,35 @@ def find_representative_days(df, n_clusters=4):
         # 描述生成
         avg_wind_p_cap = wind_features[day_idx].mean()
         avg_solar_p_cap = solar_features[day_idx].mean()
+        night_wind = wind_night_avg[day_idx]
+        day_wind = wind_day_avg[day_idx]
 
         desc = []
-        if avg_wind_p_cap > 0.4:
-            desc.append("High Wind")
+        # 风电描述（考虑昼夜差异）
+        if night_wind > 0.4 and night_wind > day_wind * 1.2:
+            desc.append("夜间大风")
+        elif avg_wind_p_cap > 0.4:
+            desc.append("全天强风")
         elif avg_wind_p_cap > 0.15:
-            desc.append("Med Wind")
+            desc.append("中等风力")
         else:
-            desc.append("Low Wind")
+            desc.append("弱风")
 
+        # 光伏描述
         if avg_solar_p_cap > 0.25:
-            desc.append("High Solar")
+            desc.append("强光照")
         elif avg_solar_p_cap > 0.1:
-            desc.append("Med Solar")
+            desc.append("中等光照")
         else:
-            desc.append("Low Solar")
+            desc.append("弱光照")
 
         results.append({
-            'cluster_id': cluster_id, 'start_idx': start_idx, 'date': date, 'desc': ", ".join(desc)
+            'cluster_id': cluster_id,
+            'start_idx': start_idx,
+            'date': date,
+            'desc': ", ".join(desc)
         })
-        print(f"   类别 {cluster_id}: {desc} | 日期: {date}")
+        print(f"   类别 {cluster_id}: {', '.join(desc)} | 日期: {date} | 夜间风电: {night_wind:.2f}, 白天风电: {day_wind:.2f}")
 
     return results
 

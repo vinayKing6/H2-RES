@@ -2,6 +2,7 @@
 """
 高质量顶刊级别可视化脚本
 包含：能量流桑基图、堆叠面积图、热力图、雷达图等多种专业图表
+Version: V12.0 - 支持V12环境（Agent-Driven Allocation）
 """
 import sys
 import os
@@ -20,7 +21,18 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-from src.envs.h2_res_env import H2RESEnv
+# 支持多版本环境
+try:
+    from src.envs.h2_res_env_v12 import H2RESEnv as H2RESEnvV12
+    USE_V12 = True
+except ImportError:
+    USE_V12 = False
+
+try:
+    from src.envs.h2_res_env import H2RESEnv
+except ImportError:
+    H2RESEnv = None
+
 from src.algos.ddpg import DDPGAgent
 
 # ==================== 配置 ====================
@@ -30,7 +42,7 @@ REAL_DATA_PATHS = {
     'wind': os.path.join(DATA_DIR, 'Wind farm site 1 (Nominal capacity-99MW).xlsx'),
     'solar': os.path.join(DATA_DIR, 'Solar station site 1 (Nominal capacity-50MW).xlsx')
 }
-N_CLUSTERS = 4
+N_CLUSTERS = 5  # 扩展到5个典型日，更好地覆盖不同场景
 
 # 顶刊配色方案 (Nature/Science风格)
 COLORS = {
@@ -136,8 +148,8 @@ def load_real_data_for_eval():
     return df_hourly
 
 
-def find_representative_days(df, n_clusters=4):
-    """聚类寻找典型日"""
+def find_representative_days(df, n_clusters=5):
+    """聚类寻找典型日（增强版V2：更好地识别风光大发、夜间大风等场景）"""
     print(f"正在进行 K-Means 聚类 (k={n_clusters})...")
     n_days = len(df) // 24
     df_cut = df.iloc[:n_days * 24]
@@ -150,7 +162,42 @@ def find_representative_days(df, n_clusters=4):
     solar_norm_val = raw_irradiance / (raw_irradiance.max() + 1e-5)
     solar_features = solar_norm_val.reshape(n_days, 24)
     
-    features = np.hstack([wind_features, solar_features])
+    # ========== 增强特征V2：添加更多区分性特征 ==========
+    
+    # 1. 昼夜风电差异特征
+    night_mask = np.zeros(24, dtype=bool)
+    night_mask[0:6] = True
+    night_mask[18:24] = True
+    day_mask = ~night_mask
+    
+    wind_night_avg = wind_features[:, night_mask].mean(axis=1)
+    wind_day_avg = wind_features[:, day_mask].mean(axis=1)
+    wind_night_day_ratio = wind_night_avg / (wind_day_avg + 1e-5)
+    
+    # 2. 总发电量特征（关键！用于识别风光大发日）
+    wind_total_daily = wind_features.mean(axis=1)  # 日均风电
+    solar_total_daily = solar_features.mean(axis=1)  # 日均光伏
+    total_re_daily = wind_total_daily + solar_total_daily  # 日均总可再生能源
+    
+    # 3. 光伏峰值特征（识别强光照日）
+    solar_peak = solar_features.max(axis=1)  # 光伏峰值
+    solar_peak_hour = solar_features.argmax(axis=1)  # 峰值时刻
+    
+    # 4. 风电稳定性特征
+    wind_std = wind_features.std(axis=1)  # 风电波动性
+    
+    # 组合特征（增加权重到关键特征）
+    features = np.hstack([
+        wind_features * 0.5,                    # 24维：每小时风电（降低权重）
+        solar_features * 0.5,                   # 24维：每小时光伏（降低权重）
+        wind_total_daily.reshape(-1, 1) * 5.0, # 1维：日均风电（高权重！）
+        solar_total_daily.reshape(-1, 1) * 5.0,# 1维：日均光伏（高权重！）
+        total_re_daily.reshape(-1, 1) * 8.0,   # 1维：日均总发电（最高权重！）
+        solar_peak.reshape(-1, 1) * 3.0,       # 1维：光伏峰值（中等权重）
+        wind_night_day_ratio.reshape(-1, 1) * 2.0,  # 1维：夜间/白天风电比例
+        wind_night_avg.reshape(-1, 1) * 2.0,   # 1维：夜间平均风电
+        wind_std.reshape(-1, 1),                # 1维：风电波动性
+    ])
     
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     kmeans.fit(features)
@@ -166,42 +213,77 @@ def find_representative_days(df, n_clusters=4):
         
         avg_wind_p_cap = wind_features[day_idx].mean()
         avg_solar_p_cap = solar_features[day_idx].mean()
+        total_re = wind_total_daily[day_idx] + solar_total_daily[day_idx]
+        night_wind = wind_night_avg[day_idx]
+        day_wind = wind_day_avg[day_idx]
+        solar_pk = solar_peak[day_idx]
         
         desc = []
-        if avg_wind_p_cap > 0.4:
-            desc.append("High Wind")
-        elif avg_wind_p_cap > 0.15:
-            desc.append("Med Wind")
-        else:
-            desc.append("Low Wind")
         
-        if avg_solar_p_cap > 0.25:
-            desc.append("High Solar")
-        elif avg_solar_p_cap > 0.1:
-            desc.append("Med Solar")
-        else:
-            desc.append("Low Solar")
+        # ========== 改进的场景识别逻辑 ==========
+        
+        # 1. 优先识别"风光大发日"（最重要！）
+        if total_re > 0.6:
+            desc.append("🌟风光大发")  # 总发电量>60%
+        elif total_re > 0.45:
+            desc.append("风光充足")  # 总发电量>45%
+        
+        # 2. 识别特殊风电场景
+        if night_wind > 0.4 and night_wind > day_wind * 1.2:
+            desc.append("夜间大风")
+        elif avg_wind_p_cap > 0.5:
+            desc.append("全天强风")
+        elif avg_wind_p_cap > 0.25:
+            desc.append("中等风力")
+        elif avg_wind_p_cap < 0.1:
+            desc.append("弱风")
+        
+        # 3. 识别光伏场景
+        if solar_pk > 0.6:
+            desc.append("强光照")
+        elif solar_pk > 0.3:
+            desc.append("中等光照")
+        elif solar_pk < 0.15:
+            desc.append("弱光照/阴天")
         
         results.append({
             'cluster_id': cluster_id,
             'start_idx': start_idx,
             'date': date,
-            'desc': ", ".join(desc)
+            'desc': ", ".join(desc),
+            'total_re': total_re,
+            'avg_wind': avg_wind_p_cap,
+            'avg_solar': avg_solar_p_cap,
+            'solar_peak': solar_pk,
+            'night_wind': night_wind,
+            'day_wind': day_wind
         })
-        print(f"   类别 {cluster_id}: {', '.join(desc)} | 日期: {date}")
+        print(f"   类别 {cluster_id}: {', '.join(desc)}")
+        print(f"      日期: {date} | 总发电: {total_re:.2%} | 风电: {avg_wind_p_cap:.2%} | 光伏峰值: {solar_pk:.2%}")
     
     return results
 
 
 # ==================== 高级可视化函数 ====================
 
-def plot_advanced_training_convergence():
+def plot_advanced_training_convergence(version='v12'):
     """高级训练收敛曲线 - 包含统计信息"""
-    log_path = 'results/training_rewards.npy'
+    # 根据版本选择文件
+    if version == 'v12':
+        log_path = 'results/training_rewards_v12.npy'
+        h2_path = 'results/training_h2prod_v12.npy'
+        title_suffix = 'V12 (Agent-Driven)'
+    else:
+        log_path = 'results/training_rewards.npy'
+        h2_path = 'results/training_h2prod.npy'
+        title_suffix = 'Standard'
+    
     if not os.path.exists(log_path):
+        print(f"[SKIP] {log_path} not found")
         return
     
     rewards = np.load(log_path)
+    h2_prod = np.load(h2_path) if os.path.exists(h2_path) else None
     
     fig = plt.figure(figsize=(14, 5))
     gs = GridSpec(1, 2, width_ratios=[2, 1], wspace=0.3)
@@ -230,7 +312,7 @@ def plot_advanced_training_convergence():
     
     ax1.set_xlabel('训练回合', fontweight='bold')
     ax1.set_ylabel('累积奖励', fontweight='bold')
-    ax1.set_title('(a) DDPG训练收敛曲线', fontweight='bold', loc='left')
+    ax1.set_title(f'(a) DDPG训练收敛曲线 ({title_suffix})', fontweight='bold', loc='left')
     ax1.legend(loc='lower right', framealpha=0.9)
     ax1.grid(True, alpha=0.3, linestyle='--')
     ax1.spines['top'].set_visible(False)
@@ -262,12 +344,13 @@ def plot_advanced_training_convergence():
     ax2.spines['right'].set_visible(False)
     ax2.grid(axis='x', alpha=0.3, linestyle='--')
     
-    plt.savefig('results/advanced_training_convergence.png', dpi=300, bbox_inches='tight')
+    save_name = f'results/advanced_training_convergence_{version}.png'
+    plt.savefig(save_name, dpi=300, bbox_inches='tight')
     plt.close()
-    print("[OK] 已生成: advanced_training_convergence.png")
+    print(f"[OK] 已生成: {save_name}")
 
 
-def plot_comprehensive_typical_day(history, day_info, day_num):
+def plot_comprehensive_typical_day(history, day_info, day_num, version='v12'):
     """综合典型日可视化 - 多子图布局"""
     
     fig = plt.figure(figsize=(16, 12))
@@ -278,7 +361,8 @@ def plot_comprehensive_typical_day(history, day_info, day_num):
     time_labels = [t.strftime("%H:%M") for t in history['Time']]
     
     # 主标题
-    fig.suptitle(f'典型日 {day_num}: {day_info["desc"]} ({day_info["date"]})',
+    version_label = 'V12 (Agent-Driven)' if version == 'v12' else 'Standard'
+    fig.suptitle(f'典型日 {day_num}: {day_info["desc"]} ({day_info["date"]}) - {version_label}',
                  fontsize=16, fontweight='bold', y=0.995)
     
     # ========== 子图1: 堆叠面积图 - 能源供应 ==========
@@ -494,23 +578,41 @@ def plot_comprehensive_typical_day(history, day_info, day_num):
     ax6.grid(True, linestyle='--', alpha=0.5)
     
     # 保存
-    save_name = f'results/advanced_typical_day_{day_num}_{day_info["date"]}.png'
+    save_name = f'results/advanced_typical_day_{version}_{day_num}_{day_info["date"]}.png'
     plt.savefig(save_name, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[OK] 已生成: {save_name}")
 
 
 # ==================== 主函数 ====================
-def advanced_visualization():
-    """执行高级可视化"""
+def advanced_visualization(version='v12'):
+    """执行高级可视化
+    
+    Args:
+        version: 'v12' for V12 environment, 'standard' for standard environment
+    """
     
     print("\n" + "="*60)
-    print("  高质量顶刊级别可视化系统")
+    print(f"  高质量顶刊级别可视化系统 ({version.upper()})")
     print("="*60 + "\n")
+    
+    # 选择环境
+    if version == 'v12':
+        if not USE_V12:
+            print("[ERROR] V12环境未找到，请确保 src/envs/h2_res_env_v12.py 存在")
+            return
+        EnvClass = H2RESEnvV12
+        model_path = 'results/ddpg_v12.pth'
+    else:
+        if H2RESEnv is None:
+            print("[ERROR] 标准环境未找到")
+            return
+        EnvClass = H2RESEnv
+        model_path = 'results/ddpg_checkpoint.pth'
     
     # 1. 训练收敛曲线
     print("[1/5] 生成训练收敛分析图...")
-    plot_advanced_training_convergence()
+    plot_advanced_training_convergence(version=version)
     
     # 2. 加载数据
     if USE_REAL_DATA and os.path.exists(REAL_DATA_PATHS['wind']):
@@ -523,15 +625,15 @@ def advanced_visualization():
     typical_days = find_representative_days(df_data, n_clusters=N_CLUSTERS)
     
     # 4. 加载模型
-    temp_env = H2RESEnv(df_data.iloc[:48], df_data.iloc[:48])
+    temp_env = EnvClass(df_data.iloc[:48], df_data.iloc[:48])
     agent = DDPGAgent(temp_env.observation_space.shape[0],
                      temp_env.action_space.shape[0])
     
-    if os.path.exists('results/ddpg_checkpoint.pth'):
-        agent.load('results/ddpg_checkpoint.pth')
-        print("[OK] 已加载训练好的模型\n")
+    if os.path.exists(model_path):
+        agent.load(model_path)
+        print(f"[OK] 已加载训练好的模型: {model_path}\n")
     else:
-        print("[WARNING] 未找到模型，使用随机策略\n")
+        print(f"[WARNING] 未找到模型 {model_path}，使用随机策略\n")
     
     # 5. 评估每个典型日
     for i, day_info in enumerate(typical_days):
@@ -542,7 +644,7 @@ def advanced_visualization():
             continue
         
         df_eval = df_data.iloc[start_idx: start_idx + 48].copy()
-        env = H2RESEnv(df_eval, df_eval)
+        env = EnvClass(df_eval, df_eval)
         
         state = env.reset()
         done = False
@@ -573,15 +675,15 @@ def advanced_visualization():
             step_count += 1
         
         # 生成综合可视化
-        plot_comprehensive_typical_day(history, day_info, i+1)
+        plot_comprehensive_typical_day(history, day_info, i+1, version=version)
     
     print("\n" + "="*60)
-    print("  [成功] 所有可视化已完成！")
+    print(f"  [成功] 所有可视化已完成！({version.upper()})")
     print("="*60)
     print("\n生成的文件:")
-    print("  [*] advanced_training_convergence.png - 训练收敛分析")
+    print(f"  [*] advanced_training_convergence_{version}.png - 训练收敛分析")
     for i in range(N_CLUSTERS):
-        print(f"  [*] advanced_typical_day_{i+1}_*.png - 典型日{i+1}综合分析")
+        print(f"  [*] advanced_typical_day_{version}_{i+1}_*.png - 典型日{i+1}综合分析")
     print("\n这些图表包含:")
     print("  [+] 堆叠面积图 (能源供需)")
     print("  [+] 双轴功率图 (储能系统)")
@@ -593,8 +695,17 @@ def advanced_visualization():
 
 
 if __name__ == "__main__":
+    import argparse
+    
     # 确保结果目录存在
     if not os.path.exists('results'):
         os.makedirs('results')
     
-    advanced_visualization()
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='高级可视化脚本')
+    parser.add_argument('--version', type=str, default='v12',
+                       choices=['v12', 'standard'],
+                       help='环境版本: v12 (V12环境) 或 standard (标准环境)')
+    args = parser.parse_args()
+    
+    advanced_visualization(version=args.version)
